@@ -30,19 +30,18 @@ use std::{
 };
 
 use bao_tree::{
-    BaoTree, ChunkRanges,
     io::{
-        Leaf,
-        mixed::{EncodedItem, ReadBytesAt, traverse_ranges_validated},
+        mixed::{traverse_ranges_validated, EncodedItem, ReadBytesAt},
         outboard::PreOrderMemOutboard,
         sync::ReadAt,
+        Leaf,
     },
+    BaoTree, ChunkRanges,
 };
 use bytes::Bytes;
 use iroh_blobs::{
-    BlobFormat, Hash, HashAndFormat,
     api::{
-        self, Store, TempTag,
+        self,
         blobs::{Bitfield, ExportProgressItem},
         proto::{
             self, BlobStatus, Command, ExportBaoMsg, ExportBaoRequest, ExportPathMsg,
@@ -50,9 +49,11 @@ use iroh_blobs::{
             ImportBaoMsg, ImportByteStreamMsg, ImportBytesMsg, ObserveMsg, ObserveRequest,
             WaitIdleMsg,
         },
+        Store, TempTag,
     },
     protocol::ChunkRangesExt,
     store::IROH_BLOCK_SIZE,
+    BlobFormat, Hash, HashAndFormat,
 };
 use irpc::channel::mpsc;
 use range_collections::range_set::RangeSetRange;
@@ -70,7 +71,6 @@ pub enum DataStrategy {
     PseudoRandom { seed: u64 },
     /// padded real data
     RealData { data: Vec<u8> },
-
 }
 
 impl Default for DataStrategy {
@@ -297,7 +297,11 @@ impl Actor {
                     cmd.tx.send(Ok(())).await.ok();
                 } else {
                     cmd.tx
-                        .send(Err(io::Error::new(io::ErrorKind::NotFound, "tag not found").into()))
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "tag not found",
+                        )
+                        .into()))
                         .await
                         .ok();
                 }
@@ -308,8 +312,11 @@ impl Actor {
                 let DeleteTagsRequest { from, to } = cmd.inner;
 
                 // delete all tags in the range [from, to)
-                let start: Bound<&api::Tag> = from.as_ref().map_or(Bound::Unbounded, |t| Bound::Included(t));
-                let end: Bound<&api::Tag> = to.as_ref().map_or(Bound::Unbounded, |t| Bound::Excluded(t));
+                let start: Bound<&api::Tag> = from
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |t| Bound::Included(t));
+                let end: Bound<&api::Tag> =
+                    to.as_ref().map_or(Bound::Unbounded, |t| Bound::Excluded(t));
 
                 let to_delete: Vec<_> = self
                     .tags
@@ -353,11 +360,13 @@ impl Actor {
                 let tags: Vec<_> = self
                     .tags
                     .iter()
-                    .map(|(name, value)| Ok(TagInfo {
-                        name: name.clone(),
-                        hash: value.hash,
-                        format: value.format,
-                    }))
+                    .map(|(name, value)| {
+                        Ok(TagInfo {
+                            name: name.clone(),
+                            hash: value.hash,
+                            format: value.format,
+                        })
+                    })
                     .collect();
                 cmd.tx.send(tags).await.ok();
             }

@@ -216,7 +216,9 @@ async fn test_data_strategy_zeros() -> TestResult<()> {
 #[tokio::test]
 async fn test_data_strategy_real_data() -> TestResult<()> {
     let store = FakeStore::builder()
-        .strategy(DataStrategy::RealData { data: vec![0xFA, 0xFB, 0xFC] })
+        .strategy(DataStrategy::RealData {
+            data: vec![0xFA, 0xFB, 0xFC],
+        })
         .with_blob(1024)
         .build();
 
@@ -230,18 +232,12 @@ async fn test_data_strategy_real_data() -> TestResult<()> {
         match item {
             ExportRangesItem::Data(leaf) => {
                 let mut iter = leaf.data.iter();
-                assert!(
-                    iter.next() == Some(&0xFA),
-                    "Expected first byte to be 0xFA"
-                );
+                assert!(iter.next() == Some(&0xFA), "Expected first byte to be 0xFA");
                 assert!(
                     iter.next() == Some(&0xFB),
                     "Expected second byte to be 0xFB"
                 );
-                assert!(
-                    iter.next() == Some(&0xFC),
-                    "Expected third byte to be 0xFC"
-                );
+                assert!(iter.next() == Some(&0xFC), "Expected third byte to be 0xFC");
                 assert!(
                     iter.all(|&b| b == 0x00),
                     "Expected all rest of the bytes to be 0x00"
@@ -526,7 +522,7 @@ async fn test_concurrent_operations() -> TestResult<()> {
 /// hash validation works (proves our data gen is consistent)
 #[tokio::test]
 async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
-    use iroh::{Endpoint, Watcher, protocol::Router};
+    use iroh::{protocol::Router, Endpoint, Watcher};
     use iroh_blobs::BlobsProtocol;
 
     tracing_subscriber::fmt::try_init().ok();
@@ -616,7 +612,7 @@ async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
 /// e2e test with both stores being FakeStore using downloader
 #[tokio::test]
 async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
-    use iroh::{Endpoint, Watcher, protocol::Router};
+    use iroh::{protocol::Router, Endpoint, Watcher};
     use iroh_blobs::BlobsProtocol;
 
     tracing_subscriber::fmt::try_init().ok();
@@ -740,6 +736,95 @@ async fn test_dynamic_blob_addition() -> TestResult<()> {
     );
 
     println!("blob was added and can be read back as fake data ᕕ( ᐛ )ᕗ");
+
+    Ok(())
+}
+
+/// test that you can dynamically add blobs to a FakeStore via add_bytes and download it using the downloader
+#[tokio::test]
+async fn test_dynamic_blob_addition_and_download() -> TestResult<()> {
+    use iroh::{protocol::Router, Endpoint, Watcher};
+    use iroh_blobs::BlobsProtocol;
+    // start with empty store
+    let provider_store = FakeStore::builder()
+        .strategy(DataStrategy::PseudoRandom { seed: 42 })
+        .build();
+
+    // verify it's empty
+    let hashes = provider_store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 0);
+
+    // add a blob dynamically via add_bytes
+    // the actual data doesn't matter - we just compute hash and store metadata
+    let data = vec![0xABu8; 1024 * 1024]; // 1MB of 0xAB
+    let result = provider_store.blobs().add_bytes(data).await?;
+    let hash = result.hash;
+
+    println!("added blob with hash: {}", hash);
+
+    // verify it's now in the store
+    let hashes = provider_store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 1);
+    assert!(hashes.contains(&hash));
+
+    // verify we can query its status
+    let status = provider_store.blobs().status(hash).await?;
+    match status {
+        BlobStatus::Complete { size } => {
+            assert_eq!(size, 1024 * 1024);
+        }
+        _ => panic!("expected complete status"),
+    }
+
+    // setup provider
+    let provider_endpoint = Endpoint::builder().bind().await?;
+    let provider_blobs = BlobsProtocol::new(&provider_store, provider_endpoint.clone(), None);
+    let provider_router = Router::builder(provider_endpoint.clone())
+        .accept(iroh_blobs::ALPN, provider_blobs)
+        .spawn();
+
+    let provider_addr = provider_router.endpoint().node_addr().initialized().await;
+
+    // receiver is also FakeStore with same strategy, starts empty
+    let receiver_store = FakeStore::builder()
+        .strategy(DataStrategy::PseudoRandom { seed: 42 })
+        .build();
+
+    let receiver_endpoint = Endpoint::builder().bind().await?;
+    receiver_endpoint.add_node_addr(provider_addr.clone())?;
+
+    // download
+    let downloader = receiver_store.downloader(&receiver_endpoint);
+    let mut progress = downloader
+        .download(hash, Some(provider_addr.node_id))
+        .stream()
+        .await?;
+
+    while let Some(event) = progress.next().await {
+        println!("download event: {:?}", event);
+    }
+
+    // verify blob is now in receiver store
+    let receiver_hashes = receiver_store.blobs().list().hashes().await?;
+    assert!(
+        receiver_hashes.contains(&hash),
+        "receiver should have the blob after download"
+    );
+
+    // verify status
+    let status = receiver_store.blobs().status(hash).await?;
+    match status {
+        BlobStatus::Complete { size } => {
+            assert_eq!(size, 1024 * 1024);
+        }
+        _ => panic!("expected complete status"),
+    }
+
+    // cleanup
+    provider_router.shutdown().await?;
+    receiver_endpoint.close().await;
+
+    println!("both stores are fake, downloader works, no memory allocated ᕕ( ᐛ )ᕗ");
 
     Ok(())
 }
