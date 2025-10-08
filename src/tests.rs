@@ -214,6 +214,47 @@ async fn test_data_strategy_zeros() -> TestResult<()> {
 }
 
 #[tokio::test]
+async fn test_data_strategy_real_data() -> TestResult<()> {
+    let store = FakeStore::builder()
+        .strategy(DataStrategy::RealData { data: vec![0xFA, 0xFB, 0xFC] })
+        .with_blob(1024)
+        .build();
+
+    let hashes = store.blobs().list().hashes().await?;
+    let hash = hashes[0];
+
+    let data = store.blobs().export_ranges(hash, 0..1024).stream();
+    tokio::pin!(data);
+
+    while let Some(item) = data.next().await {
+        match item {
+            ExportRangesItem::Data(leaf) => {
+                let mut iter = leaf.data.iter();
+                assert!(
+                    iter.next() == Some(&0xFA),
+                    "Expected first byte to be 0xFA"
+                );
+                assert!(
+                    iter.next() == Some(&0xFB),
+                    "Expected second byte to be 0xFB"
+                );
+                assert!(
+                    iter.next() == Some(&0xFC),
+                    "Expected third byte to be 0xFC"
+                );
+                assert!(
+                    iter.all(|&b| b == 0x00),
+                    "Expected all rest of the bytes to be 0x00"
+                );
+            }
+            ExportRangesItem::Error(e) => panic!("Got error: {:?}", e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_data_strategy_ones() -> TestResult<()> {
     let store = FakeStore::builder()
         .strategy(DataStrategy::Ones)

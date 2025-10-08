@@ -60,7 +60,7 @@ use ref_cast::RefCast;
 use tokio::task::{JoinError, JoinSet};
 
 /// data generation strategy for fake blobs
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataStrategy {
     /// all zeros (default, most efficient)
     Zeros,
@@ -68,6 +68,9 @@ pub enum DataStrategy {
     Ones,
     /// deterministic pseudo-random based on seed
     PseudoRandom { seed: u64 },
+    /// padded real data
+    RealData { data: Vec<u8> },
+
 }
 
 impl Default for DataStrategy {
@@ -439,7 +442,7 @@ impl Actor {
             BlobMetadata {
                 size,
                 outboard: outboard.data.into(),
-                strategy: self.strategy,
+                strategy: self.strategy.clone(),
             },
         );
 
@@ -505,7 +508,7 @@ impl Actor {
             BlobMetadata {
                 size,
                 outboard: outboard.data.into(),
-                strategy: self.strategy,
+                strategy: self.strategy.clone(),
             },
         );
 
@@ -532,7 +535,7 @@ impl Actor {
         } = msg;
 
         let size_u64 = size.get();
-        let strategy = self.strategy;
+        let strategy = self.strategy.clone();
         let blobs = self.blobs.clone();
 
         self.tasks.spawn(async move {
@@ -542,7 +545,7 @@ impl Actor {
             }
 
             // once all chunks consumed, generate fake data to compute outboard
-            let data = generate_data_for_strategy(size_u64, strategy);
+            let data = generate_data_for_strategy(size_u64, strategy.clone());
             let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
 
             // store metadata
@@ -572,7 +575,7 @@ impl DataReader {
     }
 
     fn byte_at(&self, offset: u64) -> u8 {
-        match self.strategy {
+        match self.strategy.clone() {
             DataStrategy::Zeros => 0,
             DataStrategy::Ones => 0xFF,
             DataStrategy::PseudoRandom { seed } => {
@@ -584,6 +587,13 @@ impl DataReader {
                 x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
                 x = x ^ (x >> 31);
                 (x >> 24) as u8
+            }
+            DataStrategy::RealData { data } => {
+                if offset < data.len() as u64 {
+                    data[offset as usize]
+                } else {
+                    0
+                }
             }
         }
     }
@@ -607,14 +617,14 @@ impl ReadBytesAt for DataReader {
 }
 
 fn generate_data_for_strategy(size: u64, strategy: DataStrategy) -> Vec<u8> {
-    let reader = DataReader::new(strategy);
+    let reader = DataReader::new(strategy.clone());
     let mut data = vec![0u8; size as usize];
     reader.read_at(0, &mut data).expect("read should succeed");
     data
 }
 
 fn compute_hash_for_strategy(size: u64, strategy: DataStrategy) -> Hash {
-    let data = generate_data_for_strategy(size, strategy);
+    let data = generate_data_for_strategy(size, strategy.clone());
     let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
     Hash::from(outboard.root)
 }
@@ -696,7 +706,7 @@ async fn export_ranges_impl(
                 "missing range: {requested:?}, present: {bitfield:?}",
             )));
         }
-        let reader = DataReader::new(metadata.strategy);
+        let reader = DataReader::new(metadata.strategy.clone());
         let bs = 1024;
         let mut offset = range.start;
         loop {
@@ -726,15 +736,15 @@ impl FakeStore {
     fn new_with_config(sizes: impl IntoIterator<Item = u64>, config: FakeStoreConfig) -> Self {
         let mut blobs = HashMap::new();
         for size in sizes {
-            let hash = compute_hash_for_strategy(size, config.strategy);
-            let data = generate_data_for_strategy(size, config.strategy);
+            let hash = compute_hash_for_strategy(size, config.strategy.clone());
+            let data = generate_data_for_strategy(size, config.strategy.clone());
             let outboard_data = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
             blobs.insert(
                 hash,
                 BlobMetadata {
                     size,
                     outboard: outboard_data.data.into(),
-                    strategy: config.strategy,
+                    strategy: config.strategy.clone(),
                 },
             );
         }
