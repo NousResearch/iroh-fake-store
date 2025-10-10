@@ -1,6 +1,6 @@
 use super::*;
 use bao_tree::io::mixed::EncodedItem;
-use iroh_blobs::api::proto::ExportRangesItem;
+use iroh_blobs::api::{downloader::DownloadProgressItem, proto::ExportRangesItem};
 use n0_future::stream::StreamExt;
 
 type TestResult<T> = anyhow::Result<T>;
@@ -802,6 +802,9 @@ async fn test_dynamic_blob_addition_and_download() -> TestResult<()> {
 
     while let Some(event) = progress.next().await {
         println!("download event: {:?}", event);
+        if let DownloadProgressItem::Error(err) = event {
+            panic!("download error: {err}");
+        }
     }
 
     // verify blob is now in receiver store
@@ -819,6 +822,9 @@ async fn test_dynamic_blob_addition_and_download() -> TestResult<()> {
         }
         _ => panic!("expected complete status"),
     }
+
+    let rx_data = receiver_store.blobs().get_bytes(hash).await.unwrap();
+    assert!(!rx_data.iter().all(|b| *b == 0xABu8));
 
     // cleanup
     provider_router.shutdown().await?;
@@ -1024,6 +1030,63 @@ async fn test_tag_multiple_tags_same_hash() -> TestResult<()> {
     let tag_names: Vec<_> = tags.iter().map(|t| &t.name).collect();
     assert!(tag_names.contains(&&tag1));
     assert!(tag_names.contains(&&tag2));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_max_blob_size_enforcement() -> TestResult<()> {
+    // test that builder panics when blob size exceeds max
+    let result = std::panic::catch_unwind(|| {
+        FakeStore::builder()
+            .max_blob_size(Some(1024))
+            .with_blob(2048) // exceeds max
+            .build()
+    });
+    assert!(result.is_err(), "expected panic when blob size exceeds max");
+
+    // test that builder succeeds when blob size is within max
+    let store = FakeStore::builder()
+        .max_blob_size(Some(2048))
+        .with_blob(1024) // within max
+        .build();
+
+    let hashes = store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 1);
+
+    // test default max (10GB)
+    let large_size = 5 * 1024 * 1024 * 1024; // 5GB
+    let store = FakeStore::builder().with_blob(large_size).build();
+
+    let hashes = store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_huge_blob_streaming() -> TestResult<()> {
+    // test with large blob - should work without allocating full amount of memory
+    let huge_size = 1024u64 * 1024 * 1024; // 1GB
+
+    let store = FakeStore::builder()
+        .max_blob_size(None) // no limit
+        .with_blob(huge_size)
+        .strategy(DataStrategy::Zeros)
+        .build();
+
+    let hashes = store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 1);
+
+    let hash = hashes[0];
+
+    let status = store.blobs().status(hash).await?;
+    match status {
+        BlobStatus::Complete { size } => {
+            assert_eq!(size, huge_size);
+        }
+        _ => panic!("expected complete status"),
+    }
 
     Ok(())
 }

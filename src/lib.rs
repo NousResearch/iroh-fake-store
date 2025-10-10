@@ -30,10 +30,11 @@ use std::{
 };
 
 use bao_tree::{
+    blake3,
     io::{
         mixed::{traverse_ranges_validated, EncodedItem, ReadBytesAt},
         outboard::PreOrderMemOutboard,
-        sync::ReadAt,
+        sync::{outboard, OutboardMut, ReadAt},
         Leaf,
     },
     BaoTree, ChunkRanges,
@@ -312,11 +313,9 @@ impl Actor {
                 let DeleteTagsRequest { from, to } = cmd.inner;
 
                 // delete all tags in the range [from, to)
-                let start: Bound<&api::Tag> = from
-                    .as_ref()
-                    .map_or(Bound::Unbounded, |t| Bound::Included(t));
-                let end: Bound<&api::Tag> =
-                    to.as_ref().map_or(Bound::Unbounded, |t| Bound::Excluded(t));
+                let start: Bound<&api::Tag> =
+                    from.as_ref().map_or(Bound::Unbounded, Bound::Included);
+                let end: Bound<&api::Tag> = to.as_ref().map_or(Bound::Unbounded, Bound::Excluded);
 
                 let to_delete: Vec<_> = self
                     .tags
@@ -423,7 +422,6 @@ impl Actor {
     }
 
     async fn handle_import_bytes(&mut self, msg: ImportBytesMsg) {
-        use bao_tree::io::outboard::PreOrderMemOutboard;
         use iroh_blobs::api::blobs::AddProgressItem;
 
         let ImportBytesMsg {
@@ -441,16 +439,15 @@ impl Actor {
             return;
         }
 
-        // compute hash from the actual data
-        let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
-        let hash = Hash::from(outboard.root);
+        // compute hash from strategy-generated data using streaming approach
+        let hash = compute_hash_streaming(size, self.strategy.clone());
 
         // store metadata (we don't store the actual data, just remember the size)
         self.blobs.lock().unwrap().insert(
             hash,
             BlobMetadata {
                 size,
-                outboard: outboard.data.into(),
+                outboard: Bytes::new(),
                 strategy: self.strategy.clone(),
             },
         );
@@ -467,7 +464,6 @@ impl Actor {
     }
 
     async fn handle_import_byte_stream(&mut self, msg: ImportByteStreamMsg) {
-        use bao_tree::io::outboard::PreOrderMemOutboard;
         use iroh_blobs::api::blobs::AddProgressItem;
         use proto::ImportByteStreamUpdate;
 
@@ -507,16 +503,15 @@ impl Actor {
             return;
         }
 
-        // compute hash
-        let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
-        let hash = Hash::from(outboard.root);
+        // compute hash using streaming approach
+        let hash = compute_hash_streaming(size, self.strategy.clone());
 
         // store metadata
         self.blobs.lock().unwrap().insert(
             hash,
             BlobMetadata {
                 size,
-                outboard: outboard.data.into(),
+                outboard: Bytes::new(),
                 strategy: self.strategy.clone(),
             },
         );
@@ -533,11 +528,10 @@ impl Actor {
     }
 
     async fn handle_import_bao(&mut self, msg: ImportBaoMsg) {
-        use bao_tree::io::outboard::PreOrderMemOutboard;
         use proto::ImportBaoRequest;
 
         let ImportBaoMsg {
-            inner: ImportBaoRequest { hash, size },
+            inner: ImportBaoRequest { hash: _, size },
             tx,
             mut rx,
             ..
@@ -553,16 +547,21 @@ impl Actor {
                 // just drain them, don't store
             }
 
-            // once all chunks consumed, generate fake data to compute outboard
-            let data = generate_data_for_strategy(size_u64, strategy.clone());
-            let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+            // once all chunks consumed, compute outboard using streaming
+            let tree = BaoTree::new(size_u64, IROH_BLOCK_SIZE);
+            let data = DataReader::new(strategy.clone());
+            let mut dummy_outboard = NoOpOutboard;
+            let root =
+                outboard(data, tree, &mut dummy_outboard).expect("hash computation should succeed");
+            let outboard_data = Bytes::new(); // empty since we don't actually store the outboard
 
-            // store metadata
+            // store metadata using computed hash from strategy, not provided hash
+            let computed_hash = Hash::from(root);
             blobs.lock().unwrap().insert(
-                hash,
+                computed_hash,
                 BlobMetadata {
                     size: size_u64,
-                    outboard: outboard.data.into(),
+                    outboard: outboard_data,
                     strategy,
                 },
             );
@@ -576,11 +575,15 @@ impl Actor {
 #[derive(Clone)]
 struct DataReader {
     strategy: DataStrategy,
+    position: u64,
 }
 
 impl DataReader {
     fn new(strategy: DataStrategy) -> Self {
-        Self { strategy }
+        Self {
+            strategy,
+            position: 0,
+        }
     }
 
     fn byte_at(&self, offset: u64) -> u8 {
@@ -617,6 +620,16 @@ impl ReadAt for DataReader {
     }
 }
 
+impl io::Read for DataReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        for (i, byte) in buf.iter_mut().enumerate() {
+            *byte = self.byte_at(self.position + i as u64);
+        }
+        self.position += buf.len() as u64;
+        Ok(buf.len())
+    }
+}
+
 impl ReadBytesAt for DataReader {
     fn read_bytes_at(&self, offset: u64, size: usize) -> io::Result<Bytes> {
         let mut data = vec![0u8; size];
@@ -625,17 +638,89 @@ impl ReadBytesAt for DataReader {
     }
 }
 
-fn generate_data_for_strategy(size: u64, strategy: DataStrategy) -> Vec<u8> {
-    let reader = DataReader::new(strategy.clone());
-    let mut data = vec![0u8; size as usize];
-    reader.read_at(0, &mut data).expect("read should succeed");
-    data
+/// generate outboard data on-demand for export operations by creating a streaming PreOrderMemOutboard
+fn generate_outboard_data(size: u64, strategy: DataStrategy) -> Bytes {
+    let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
+    let data = DataReader::new(strategy);
+
+    // create empty outboard with correct size
+    let outboard_size = tree
+        .outboard_size()
+        .try_into()
+        .expect("outboard size fits in usize");
+    let outboard_data = vec![0u8; outboard_size];
+
+    // use a mutable outboard that writes to our buffer
+    struct VecOutboard {
+        tree: BaoTree,
+        data: Vec<u8>,
+    }
+
+    impl OutboardMut for VecOutboard {
+        fn save(
+            &mut self,
+            node: bao_tree::TreeNode,
+            hash_pair: &(blake3::Hash, blake3::Hash),
+        ) -> io::Result<()> {
+            if let Some(offset) = self.tree.pre_order_offset(node) {
+                let offset = (offset * 64) as usize;
+                let mut content = [0u8; 64];
+                content[0..32].copy_from_slice(hash_pair.0.as_bytes());
+                content[32..64].copy_from_slice(hash_pair.1.as_bytes());
+                self.data[offset..offset + 64].copy_from_slice(&content);
+            }
+            Ok(())
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut vec_outboard = VecOutboard {
+        tree,
+        data: outboard_data,
+    };
+
+    // compute outboard using streaming approach
+    let _root =
+        outboard(data, tree, &mut vec_outboard).expect("outboard computation should succeed");
+
+    Bytes::from(vec_outboard.data)
+}
+
+/// dummy outboard that just ignores saves
+struct NoOpOutboard;
+
+impl OutboardMut for NoOpOutboard {
+    fn save(
+        &mut self,
+        _node: bao_tree::TreeNode,
+        _hash_pair: &(blake3::Hash, blake3::Hash),
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn compute_hash_for_strategy(size: u64, strategy: DataStrategy) -> Hash {
-    let data = generate_data_for_strategy(size, strategy.clone());
-    let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
-    Hash::from(outboard.root)
+    compute_hash_streaming(size, strategy)
+}
+
+/// compute hash using streaming approach to avoid memory allocation
+fn compute_hash_streaming(size: u64, strategy: DataStrategy) -> Hash {
+    let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
+    let data = DataReader::new(strategy);
+    let mut dummy_outboard = NoOpOutboard;
+
+    // use the public outboard function from bao_tree
+    match outboard(data, tree, &mut dummy_outboard) {
+        Ok(hash) => Hash::from(hash),
+        Err(_) => panic!("hash computation should not fail"),
+    }
 }
 
 async fn export_bao(
@@ -661,13 +746,21 @@ async fn export_bao(
     };
 
     let size = metadata.size;
-    let data = DataReader::new(metadata.strategy);
+    let data = DataReader::new(metadata.strategy.clone());
 
     let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
+
+    // generate outboard data on-demand since we don't store it
+    let outboard_data = if metadata.outboard.is_empty() {
+        generate_outboard_data(size, metadata.strategy.clone())
+    } else {
+        metadata.outboard
+    };
+
     let outboard = PreOrderMemOutboard {
         root: hash.into(),
         tree,
-        data: metadata.outboard,
+        data: outboard_data,
     };
 
     let sender = BaoTreeSender::ref_cast_mut(&mut sender);
@@ -746,13 +839,13 @@ impl FakeStore {
         let mut blobs = HashMap::new();
         for size in sizes {
             let hash = compute_hash_for_strategy(size, config.strategy.clone());
-            let data = generate_data_for_strategy(size, config.strategy.clone());
-            let outboard_data = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+            // don't store outboard data for pre-configured blobs either
+            let outboard_data = Bytes::new();
             blobs.insert(
                 hash,
                 BlobMetadata {
                     size,
-                    outboard: outboard_data.data.into(),
+                    outboard: outboard_data,
                     strategy: config.strategy.clone(),
                 },
             );
