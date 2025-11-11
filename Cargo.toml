@@ -19,6 +19,7 @@ anyhow = "1"
 ref-cast = "1"
 irpc = "0.8"
 range-collections = "0.4"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

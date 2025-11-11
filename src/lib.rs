@@ -57,6 +57,7 @@ use iroh_blobs::{
     BlobFormat, Hash, HashAndFormat,
 };
 use irpc::channel::mpsc;
+use rand::{Rng, SeedableRng};
 use range_collections::range_set::RangeSetRange;
 use ref_cast::RefCast;
 use tokio::task::{JoinError, JoinSet};
@@ -187,11 +188,15 @@ impl bao_tree::io::mixed::Sender for BaoTreeSender {
     }
 }
 
+pub type Nonce = u64;
+pub const NONCE_SIZE: u64 = size_of::<Nonce>() as u64;
+
 #[derive(Debug, Clone)]
 struct BlobMetadata {
     size: u64,
     outboard: Bytes,
     strategy: DataStrategy,
+    nonce: Nonce,
 }
 
 struct Actor {
@@ -201,6 +206,7 @@ struct Actor {
     blobs: Arc<Mutex<HashMap<Hash, BlobMetadata>>>,
     strategy: DataStrategy,
     tags: BTreeMap<api::Tag, HashAndFormat>,
+    rng: rand::rngs::StdRng,
 }
 
 impl Actor {
@@ -216,6 +222,7 @@ impl Actor {
             idle_waiters: Vec::new(),
             strategy,
             tags: BTreeMap::new(),
+            rng: rand::rngs::StdRng::from_entropy(),
         }
     }
 
@@ -347,7 +354,7 @@ impl Actor {
                 let metadata = self.blobs.lock().unwrap().get(&hash).cloned();
                 let status = if let Some(metadata) = metadata {
                     BlobStatus::Complete {
-                        size: metadata.size,
+                        size: metadata.size + NONCE_SIZE,
                     }
                 } else {
                     BlobStatus::NotFound
@@ -439,8 +446,11 @@ impl Actor {
             return;
         }
 
-        // compute hash from strategy-generated data using streaming approach
-        let hash = compute_hash_streaming(size, self.strategy.clone());
+        // generate random nonce to make each blob unique
+        let nonce = self.rng.gen::<u64>();
+
+        // compute hash from strategy-generated data + nonce
+        let hash = compute_hash_streaming_with_nonce(size, self.strategy.clone(), nonce);
 
         // store metadata (we don't store the actual data, just remember the size)
         self.blobs.lock().unwrap().insert(
@@ -449,6 +459,7 @@ impl Actor {
                 size,
                 outboard: Bytes::new(),
                 strategy: self.strategy.clone(),
+                nonce,
             },
         );
 
@@ -503,16 +514,21 @@ impl Actor {
             return;
         }
 
-        // compute hash using streaming approach
-        let hash = compute_hash_streaming(size, self.strategy.clone());
+        // generate random nonce to make each blob unique
+        let nonce = self.rng.gen::<u64>();
+
+        // compute hash using streaming approach with nonce
+        let hash = compute_hash_streaming_with_nonce(size, self.strategy.clone(), nonce);
 
         // store metadata
         self.blobs.lock().unwrap().insert(
             hash,
             BlobMetadata {
-                size,
+                size: size + 8,      // internal size with nonce
+                external_size: size, // original size without nonce
                 outboard: Bytes::new(),
                 strategy: self.strategy.clone(),
+                nonce,
             },
         );
 
@@ -540,6 +556,7 @@ impl Actor {
         let size_u64 = size.get();
         let strategy = self.strategy.clone();
         let blobs = self.blobs.clone();
+        let nonce = self.rng.gen::<u64>();
 
         self.tasks.spawn(async move {
             // consume all incoming chunks
@@ -547,22 +564,20 @@ impl Actor {
                 // just drain them, don't store
             }
 
-            // once all chunks consumed, compute outboard using streaming
-            let tree = BaoTree::new(size_u64, IROH_BLOCK_SIZE);
-            let data = DataReader::new(strategy.clone());
-            let mut dummy_outboard = NoOpOutboard;
-            let root =
-                outboard(data, tree, &mut dummy_outboard).expect("hash computation should succeed");
+            // once all chunks consumed, compute outboard using streaming with nonce
+            let computed_hash =
+                compute_hash_streaming_with_nonce(size_u64, strategy.clone(), nonce);
             let outboard_data = Bytes::new(); // empty since we don't actually store the outboard
 
-            // store metadata using computed hash from strategy, not provided hash
-            let computed_hash = Hash::from(root);
+            // store metadata using computed hash from strategy + nonce
             blobs.lock().unwrap().insert(
                 computed_hash,
                 BlobMetadata {
-                    size: size_u64,
+                    size: size_u64 + 8,      // internal size with nonce
+                    external_size: size_u64, // original size without nonce
                     outboard: outboard_data,
                     strategy,
+                    nonce,
                 },
             );
 
@@ -576,6 +591,7 @@ impl Actor {
 struct DataReader {
     strategy: DataStrategy,
     position: u64,
+    nonce: Option<u64>, // if Some, prepend 8 bytes of nonce data
 }
 
 impl DataReader {
@@ -583,10 +599,33 @@ impl DataReader {
         Self {
             strategy,
             position: 0,
+            nonce: None,
+        }
+    }
+
+    fn new_with_nonce(strategy: DataStrategy, nonce: u64) -> Self {
+        Self {
+            strategy,
+            position: 0,
+            nonce: Some(nonce),
         }
     }
 
     fn byte_at(&self, offset: u64) -> u8 {
+        // handle nonce prefix first 8 bytes
+        if let Some(nonce) = self.nonce {
+            if offset < 8 {
+                return (nonce >> (8 * (7 - offset))) as u8;
+            }
+            // adjust offset to account for nonce prefix
+            let strategy_offset = offset - 8;
+            return self.strategy_byte_at(strategy_offset);
+        }
+
+        self.strategy_byte_at(offset)
+    }
+
+    fn strategy_byte_at(&self, offset: u64) -> u8 {
         match self.strategy.clone() {
             DataStrategy::Zeros => 0,
             DataStrategy::Ones => 0xFF,
@@ -639,9 +678,9 @@ impl ReadBytesAt for DataReader {
 }
 
 /// generate outboard data on-demand for export operations by creating a streaming PreOrderMemOutboard
-fn generate_outboard_data(size: u64, strategy: DataStrategy) -> Bytes {
+fn generate_outboard_data(size: u64, strategy: DataStrategy, nonce: u64) -> Bytes {
     let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
-    let data = DataReader::new(strategy);
+    let data = DataReader::new_with_nonce(strategy, nonce);
 
     // create empty outboard with correct size
     let outboard_size = tree
@@ -723,6 +762,135 @@ fn compute_hash_streaming(size: u64, strategy: DataStrategy) -> Hash {
     }
 }
 
+/// compute hash using streaming approach with nonce prefix
+fn compute_hash_streaming_with_nonce(size: u64, strategy: DataStrategy, nonce: u64) -> Hash {
+    let total_size = size + NONCE_SIZE; // add bytes for nonce
+    let tree = BaoTree::new(total_size, IROH_BLOCK_SIZE);
+    let data = DataReader::new_with_nonce(strategy, nonce);
+    let mut dummy_outboard = NoOpOutboard;
+
+    match outboard(data, tree, &mut dummy_outboard) {
+        Ok(hash) => Hash::from(hash),
+        Err(_) => panic!("hash computation should not fail"),
+    }
+}
+
+/// compute hash of data without nonce prefix (for exports)
+fn compute_hash_streaming_stripped(size: u64, strategy: DataStrategy, nonce: u64) -> Hash {
+    let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
+
+    struct NonceStrippingReader {
+        inner: DataReader,
+        position: u64,
+    }
+
+    impl ReadAt for NonceStrippingReader {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(offset + 8, buf)
+        }
+    }
+
+    impl io::Read for NonceStrippingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // read from inner at current position + 8 (to skip nonce)
+            for (i, byte_ref) in buf.iter_mut().enumerate() {
+                *byte_ref = self.inner.byte_at(self.position + i as u64 + 8);
+            }
+            self.position += buf.len() as u64;
+            Ok(buf.len())
+        }
+    }
+
+    let data = NonceStrippingReader {
+        inner: DataReader::new_with_nonce(strategy, nonce),
+        position: 0,
+    };
+    let mut dummy_outboard = NoOpOutboard;
+
+    match outboard(data, tree, &mut dummy_outboard) {
+        Ok(hash) => Hash::from(hash),
+        Err(_) => panic!("hash computation should not fail"),
+    }
+}
+
+/// generate outboard data for stripped data (without nonce prefix)
+fn generate_outboard_data_stripped(size: u64, strategy: DataStrategy, nonce: u64) -> Bytes {
+    let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
+
+    // create nonce-stripping reader
+    struct NonceStrippingReader {
+        inner: DataReader,
+        position: u64,
+    }
+
+    impl ReadAt for NonceStrippingReader {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(offset + 8, buf)
+        }
+    }
+
+    impl io::Read for NonceStrippingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // read from inner at current position + 8 (to skip nonce)
+            for (i, byte_ref) in buf.iter_mut().enumerate() {
+                *byte_ref = self.inner.byte_at(self.position + i as u64 + 8);
+            }
+            self.position += buf.len() as u64;
+            Ok(buf.len())
+        }
+    }
+
+    let mut data = NonceStrippingReader {
+        inner: DataReader::new_with_nonce(strategy, nonce),
+        position: 0,
+    };
+
+    // create empty outboard with correct size
+    let outboard_size = tree
+        .outboard_size()
+        .try_into()
+        .expect("outboard size fits in usize");
+    let outboard_data = vec![0u8; outboard_size];
+
+    // use a mutable outboard that writes to our buffer
+    struct VecOutboard {
+        tree: BaoTree,
+        data: Vec<u8>,
+    }
+
+    impl OutboardMut for VecOutboard {
+        fn save(
+            &mut self,
+            node: bao_tree::TreeNode,
+            hash_pair: &(blake3::Hash, blake3::Hash),
+        ) -> io::Result<()> {
+            if let Some(offset) = self.tree.pre_order_offset(node) {
+                let offset = (offset * 64) as usize;
+                let mut content = [0u8; 64];
+                content[0..32].copy_from_slice(hash_pair.0.as_bytes());
+                content[32..64].copy_from_slice(hash_pair.1.as_bytes());
+                self.data[offset..offset + 64].copy_from_slice(&content);
+            }
+            Ok(())
+        }
+
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut vec_outboard = VecOutboard {
+        tree,
+        data: outboard_data,
+    };
+
+    // compute outboard using streaming approach
+    let _root =
+        outboard(data, tree, &mut vec_outboard).expect("outboard computation should succeed");
+
+    Bytes::from(vec_outboard.data)
+}
+
 async fn export_bao(
     hash: Hash,
     metadata: Option<BlobMetadata>,
@@ -745,20 +913,46 @@ async fn export_bao(
         }
     };
 
-    let size = metadata.size;
-    let data = DataReader::new(metadata.strategy.clone());
+    let external_size = metadata.external_size; // size user should see
 
-    let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
+    // create a nonce-stripping data reader
+    struct NonceStrippingReader {
+        inner: DataReader,
+    }
 
-    // generate outboard data on-demand since we don't store it
-    let outboard_data = if metadata.outboard.is_empty() {
-        generate_outboard_data(size, metadata.strategy.clone())
-    } else {
-        metadata.outboard
+    impl ReadAt for NonceStrippingReader {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            // read from inner with +8 offset to skip nonce
+            self.inner.read_at(offset + 8, buf)
+        }
+    }
+
+    impl ReadBytesAt for NonceStrippingReader {
+        fn read_bytes_at(&self, offset: u64, size: usize) -> io::Result<Bytes> {
+            self.inner.read_bytes_at(offset + 8, size)
+        }
+    }
+
+    let data = NonceStrippingReader {
+        inner: DataReader::new_with_nonce(metadata.strategy.clone(), metadata.nonce),
     };
 
+    let tree = BaoTree::new(external_size, IROH_BLOCK_SIZE);
+
+    // generate outboard data for external size (stripped data)
+    let outboard_data = if metadata.outboard.is_empty() {
+        generate_outboard_data_stripped(external_size, metadata.strategy.clone(), metadata.nonce)
+    } else {
+        // stored outboard is for internal size, regenerate for external size
+        generate_outboard_data_stripped(external_size, metadata.strategy.clone(), metadata.nonce)
+    };
+
+    // compute hash of external data (without nonce)
+    let external_hash =
+        compute_hash_streaming_stripped(external_size, metadata.strategy.clone(), metadata.nonce);
+
     let outboard = PreOrderMemOutboard {
-        root: hash.into(),
+        root: external_hash.into(),
         tree,
         data: outboard_data,
     };
@@ -794,13 +988,15 @@ async fn export_ranges_impl(
     metadata: BlobMetadata,
 ) -> io::Result<()> {
     let ExportRangesRequest { ranges, .. } = cmd;
-    let size = metadata.size;
-    let bitfield = Bitfield::complete(size);
+    let external_size = metadata.external_size; // size without nonce (user-visible)
+    let bitfield = Bitfield::complete(external_size);
 
     for range in ranges.iter() {
         let range = match range {
-            RangeSetRange::Range(range) => size.min(*range.start)..size.min(*range.end),
-            RangeSetRange::RangeFrom(range) => size.min(*range.start)..size,
+            RangeSetRange::Range(range) => {
+                external_size.min(*range.start)..external_size.min(*range.end)
+            }
+            RangeSetRange::RangeFrom(range) => external_size.min(*range.start)..external_size,
         };
         let requested = ChunkRanges::bytes(range.start..range.end);
         if !bitfield.ranges.is_superset(&requested) {
@@ -808,13 +1004,19 @@ async fn export_ranges_impl(
                 "missing range: {requested:?}, present: {bitfield:?}",
             )));
         }
-        let reader = DataReader::new(metadata.strategy.clone());
+        let reader = DataReader::new_with_nonce(metadata.strategy.clone(), metadata.nonce);
         let bs = 1024;
         let mut offset = range.start;
         loop {
             let end: u64 = (offset + bs).min(range.end);
             let chunk_size = (end - offset) as usize;
-            let data = reader.read_bytes_at(offset, chunk_size)?;
+            // create a buffer for the data without nonce
+            let mut buf = vec![0u8; chunk_size];
+            // read from reader at (offset + 8) to skip nonce, but manually extract just the data part
+            for (i, byte_ref) in buf.iter_mut().enumerate() {
+                *byte_ref = reader.byte_at((offset + i as u64) + 8);
+            }
+            let data = Bytes::from(buf);
             tx.send(Leaf { offset, data }.into()).await?;
             offset = end;
             if offset >= range.end {
@@ -825,31 +1027,19 @@ async fn export_ranges_impl(
     Ok(())
 }
 
-impl FakeStore {
-    /// uses zeros strategy. for more control use [`FakeStore::builder()`]
-    pub fn new(sizes: impl IntoIterator<Item = u64>) -> Self {
-        Self::builder().with_blobs(sizes).build()
+impl Default for FakeStore {
+    fn default() -> Self {
+        Self::builder().build()
     }
+}
 
+impl FakeStore {
     pub fn builder() -> FakeStoreBuilder {
         FakeStoreBuilder::new()
     }
 
-    fn new_with_config(sizes: impl IntoIterator<Item = u64>, config: FakeStoreConfig) -> Self {
+    fn new(config: FakeStoreConfig) -> Self {
         let mut blobs = HashMap::new();
-        for size in sizes {
-            let hash = compute_hash_for_strategy(size, config.strategy.clone());
-            // don't store outboard data for pre-configured blobs either
-            let outboard_data = Bytes::new();
-            blobs.insert(
-                hash,
-                BlobMetadata {
-                    size,
-                    outboard: outboard_data,
-                    strategy: config.strategy.clone(),
-                },
-            );
-        }
 
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let actor = Actor::new(receiver, blobs, config.strategy);

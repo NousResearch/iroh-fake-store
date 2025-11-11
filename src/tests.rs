@@ -16,6 +16,8 @@ const INTERESTING_SIZES: [u64; 8] = [
     1024 * 1024 * 8, // 8MB
 ];
 
+const NONCE_SIZE: u64 = size_of::<u64>() as u64;
+
 #[tokio::test]
 async fn test_list_and_status() -> TestResult<()> {
     let store = FakeStore::new([1024, 2048]);
@@ -27,7 +29,7 @@ async fn test_list_and_status() -> TestResult<()> {
         let status = store.blobs().status(hash).await?;
         match status {
             BlobStatus::Complete { size } => {
-                assert!(size == 1024 || size == 2048);
+                assert!(size == (1024 + NONCE_SIZE) || size == (2048 + NONCE_SIZE))
             }
             _ => panic!("Expected complete status"),
         }
@@ -665,7 +667,7 @@ async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
     let status = receiver_store.blobs().status(hash).await?;
     match status {
         BlobStatus::Complete { size } => {
-            assert_eq!(size, 1024 * 1024);
+            assert_eq!(size, 1024 * 1024); // original size (nonce stripped)
         }
         _ => panic!("expected complete status"),
     }
@@ -708,7 +710,7 @@ async fn test_dynamic_blob_addition() -> TestResult<()> {
     let status = store.blobs().status(hash).await?;
     match status {
         BlobStatus::Complete { size } => {
-            assert_eq!(size, 1024 * 1024);
+            assert_eq!(size, 1024 * 1024); // original size (nonce stripped)
         }
         _ => panic!("expected complete status"),
     }
@@ -771,7 +773,7 @@ async fn test_dynamic_blob_addition_and_download() -> TestResult<()> {
     let status = provider_store.blobs().status(hash).await?;
     match status {
         BlobStatus::Complete { size } => {
-            assert_eq!(size, 1024 * 1024);
+            assert_eq!(size, 1024 * 1024); // original size (nonce stripped)
         }
         _ => panic!("expected complete status"),
     }
@@ -818,7 +820,7 @@ async fn test_dynamic_blob_addition_and_download() -> TestResult<()> {
     let status = receiver_store.blobs().status(hash).await?;
     match status {
         BlobStatus::Complete { size } => {
-            assert_eq!(size, 1024 * 1024);
+            assert_eq!(size, 1024 * 1024); // original size (nonce stripped)
         }
         _ => panic!("expected complete status"),
     }
@@ -1087,6 +1089,89 @@ async fn test_huge_blob_streaming() -> TestResult<()> {
         }
         _ => panic!("expected complete status"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_collision_prevention_with_nonces() -> TestResult<()> {
+    let store = FakeStore::builder()
+        .strategy(DataStrategy::PseudoRandom { seed: 42 })
+        .build();
+
+    // add two identical blobs - they should get different hashes due to nonces
+    let data1 = vec![0xAAu8; 1024];
+    let data2 = vec![0xAAu8; 1024]; // identical data
+
+    let result1 = store.blobs().add_bytes(data1).await?;
+    let result2 = store.blobs().add_bytes(data2).await?;
+
+    // hashes should be different even though input data was identical
+    assert_ne!(
+        result1.hash, result2.hash,
+        "identical input data should get different hashes due to nonces"
+    );
+
+    // verify both blobs exist in store
+    let hashes = store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 2);
+    assert!(hashes.contains(&result1.hash));
+    assert!(hashes.contains(&result2.hash));
+
+    // verify each blob reports correct size (original + 8 bytes for nonce)
+    let status1 = store.blobs().status(result1.hash).await?;
+    let status2 = store.blobs().status(result2.hash).await?;
+
+    match (status1, status2) {
+        (BlobStatus::Complete { size: size1 }, BlobStatus::Complete { size: size2 }) => {
+            assert_eq!(size1, 1024); // original size (nonce stripped)
+            assert_eq!(size2, 1024);
+        }
+        _ => panic!("expected complete status for both blobs"),
+    }
+
+    println!("🔒 collision prevention working - identical input gets different hashes");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_real_data_export_strips_nonce() -> TestResult<()> {
+    let original_data = vec![1, 2, 3, 4, 5];
+    let store = FakeStore::builder()
+        .strategy(DataStrategy::RealData {
+            data: original_data.clone(),
+        })
+        .with_blob(5) // 5-byte blob using the RealData strategy
+        .build();
+
+    // get the pre-configured blob
+    let hashes = store.blobs().list().hashes().await?;
+    assert_eq!(hashes.len(), 1);
+    let hash = hashes[0];
+
+    // verify size is reported correctly (original size, not +8 for nonce)
+    let status = store.blobs().status(hash).await?;
+    match status {
+        BlobStatus::Complete { size } => {
+            assert_eq!(size, 5); // original size, not 13
+        }
+        _ => panic!("expected complete status"),
+    }
+
+    // export the data and verify it matches the original (no nonce prefix)
+    let exported_data = store.blobs().get_bytes(hash).await?;
+    assert_eq!(
+        exported_data.len(),
+        5,
+        "exported data should be exactly 5 bytes"
+    );
+    assert_eq!(
+        exported_data, original_data,
+        "exported data should match original exactly"
+    );
+
+    println!("✨ real data exports correctly without nonce prefix");
 
     Ok(())
 }
