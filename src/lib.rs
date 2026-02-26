@@ -81,6 +81,8 @@ pub struct FakeStoreConfig {
     pub strategy: DataStrategy,
     /// max blob size (prevents accidents)
     pub max_blob_size: Option<u64>,
+    /// throttle read bandwidth to this many bytes per second (None = unlimited)
+    pub throttle_bytes_per_sec: Option<u64>,
 }
 
 impl Default for FakeStoreConfig {
@@ -89,6 +91,7 @@ impl Default for FakeStoreConfig {
             strategy: DataStrategy::Zeros,
             // 10GB limit to prevent accidents
             max_blob_size: Some(10 * 1024 * 1024 * 1024),
+            throttle_bytes_per_sec: None,
         }
     }
 }
@@ -96,7 +99,8 @@ impl Default for FakeStoreConfig {
 #[derive(Debug, Clone, Default)]
 pub struct FakeStoreBuilder {
     config: FakeStoreConfig,
-    sizes: Vec<u64>,
+    /// Each blob can have its own strategy override
+    blobs: Vec<(u64, Option<DataStrategy>)>,
 }
 
 impl FakeStoreBuilder {
@@ -116,12 +120,29 @@ impl FakeStoreBuilder {
     }
 
     pub fn with_blob(mut self, size: u64) -> Self {
-        self.sizes.push(size);
+        self.blobs.push((size, None));
         self
     }
 
     pub fn with_blobs(mut self, sizes: impl IntoIterator<Item = u64>) -> Self {
-        self.sizes.extend(sizes);
+        self.blobs.extend(sizes.into_iter().map(|s| (s, None)));
+        self
+    }
+
+    /// Create `count` blobs of the same size, each with a unique PseudoRandom seed
+    /// so they have distinct hashes. Use this when you need many same-sized blobs.
+    pub fn with_unique_blobs(mut self, count: usize, size: u64) -> Self {
+        for i in 0..count {
+            self.blobs
+                .push((size, Some(DataStrategy::PseudoRandom { seed: i as u64 })));
+        }
+        self
+    }
+
+    /// Throttle read bandwidth to the given bytes per second.
+    /// This simulates slow peers by adding delays during BAO export.
+    pub fn with_throttle(mut self, bytes_per_sec: u64) -> Self {
+        self.config.throttle_bytes_per_sec = Some(bytes_per_sec);
         self
     }
 
@@ -129,12 +150,18 @@ impl FakeStoreBuilder {
     /// panics if any blob size exceeds the configured max
     pub fn build(self) -> FakeStore {
         if let Some(max) = self.config.max_blob_size {
-            for &size in &self.sizes {
+            for &(size, _) in &self.blobs {
                 assert!(size <= max, "Blob size {} exceeds maximum {}", size, max);
             }
         }
 
-        FakeStore::new_with_config(self.sizes, self.config)
+        let blob_specs: Vec<(u64, DataStrategy)> = self
+            .blobs
+            .into_iter()
+            .map(|(size, strategy)| (size, strategy.unwrap_or(self.config.strategy)))
+            .collect();
+
+        FakeStore::new_with_config(blob_specs, self.config)
     }
 }
 
@@ -188,6 +215,9 @@ struct BlobMetadata {
     size: u64,
     outboard: Bytes,
     strategy: DataStrategy,
+    /// Real data for dynamically-imported blobs (via add_bytes/add_byte_stream).
+    /// When set, this takes priority over the strategy for data generation.
+    real_data: Option<Bytes>,
 }
 
 struct Actor {
@@ -197,6 +227,7 @@ struct Actor {
     blobs: Arc<Mutex<HashMap<Hash, BlobMetadata>>>,
     strategy: DataStrategy,
     tags: BTreeMap<api::Tag, HashAndFormat>,
+    throttle_bytes_per_sec: Option<u64>,
 }
 
 impl Actor {
@@ -204,6 +235,7 @@ impl Actor {
         commands: tokio::sync::mpsc::Receiver<proto::Command>,
         blobs: HashMap<Hash, BlobMetadata>,
         strategy: DataStrategy,
+        throttle_bytes_per_sec: Option<u64>,
     ) -> Self {
         Self {
             blobs: Arc::new(Mutex::new(blobs)),
@@ -212,6 +244,7 @@ impl Actor {
             idle_waiters: Vec::new(),
             strategy,
             tags: BTreeMap::new(),
+            throttle_bytes_per_sec,
         }
     }
 
@@ -259,7 +292,9 @@ impl Actor {
                 ..
             }) => {
                 let metadata = self.blobs.lock().unwrap().get(&hash).cloned();
-                self.tasks.spawn(export_bao(hash, metadata, ranges, tx));
+                let throttle = self.throttle_bytes_per_sec;
+                self.tasks
+                    .spawn(export_bao(hash, metadata, ranges, tx, throttle));
             }
             Command::ExportPath(ExportPathMsg {
                 inner: ExportPathRequest { hash, target, .. },
@@ -294,7 +329,11 @@ impl Actor {
                     cmd.tx.send(Ok(())).await.ok();
                 } else {
                     cmd.tx
-                        .send(Err(io::Error::new(io::ErrorKind::NotFound, "tag not found").into()))
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "tag not found",
+                        )
+                        .into()))
                         .await
                         .ok();
                 }
@@ -305,8 +344,11 @@ impl Actor {
                 let DeleteTagsRequest { from, to } = cmd.inner;
 
                 // delete all tags in the range [from, to)
-                let start: Bound<&api::Tag> = from.as_ref().map_or(Bound::Unbounded, |t| Bound::Included(t));
-                let end: Bound<&api::Tag> = to.as_ref().map_or(Bound::Unbounded, |t| Bound::Excluded(t));
+                let start: Bound<&api::Tag> = from
+                    .as_ref()
+                    .map_or(Bound::Unbounded, |t| Bound::Included(t));
+                let end: Bound<&api::Tag> =
+                    to.as_ref().map_or(Bound::Unbounded, |t| Bound::Excluded(t));
 
                 let to_delete: Vec<_> = self
                     .tags
@@ -314,10 +356,10 @@ impl Actor {
                     .map(|(k, _)| k.clone())
                     .collect();
 
-                for tag in to_delete {
-                    self.tags.remove(&tag);
+                for tag in &to_delete {
+                    self.tags.remove(tag);
                 }
-                cmd.tx.send(Ok(())).await.ok();
+                cmd.tx.send(Ok(to_delete.len() as u64)).await.ok();
             }
             Command::DeleteBlobs(cmd) => {
                 cmd.tx
@@ -350,11 +392,13 @@ impl Actor {
                 let tags: Vec<_> = self
                     .tags
                     .iter()
-                    .map(|(name, value)| Ok(TagInfo {
-                        name: name.clone(),
-                        hash: value.hash,
-                        format: value.format,
-                    }))
+                    .map(|(name, value)| {
+                        Ok(TagInfo {
+                            name: name.clone(),
+                            hash: value.hash,
+                            format: value.format,
+                        })
+                    })
                     .collect();
                 cmd.tx.send(tags).await.ok();
             }
@@ -433,13 +477,14 @@ impl Actor {
         let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
         let hash = Hash::from(outboard.root);
 
-        // store metadata (we don't store the actual data, just remember the size)
+        // store metadata with real data so it can be served back correctly
         self.blobs.lock().unwrap().insert(
             hash,
             BlobMetadata {
                 size,
                 outboard: outboard.data.into(),
                 strategy: self.strategy,
+                real_data: Some(Bytes::copy_from_slice(&data)),
             },
         );
 
@@ -499,13 +544,14 @@ impl Actor {
         let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
         let hash = Hash::from(outboard.root);
 
-        // store metadata
+        // store metadata with real data for dynamically-imported blobs
         self.blobs.lock().unwrap().insert(
             hash,
             BlobMetadata {
                 size,
                 outboard: outboard.data.into(),
                 strategy: self.strategy,
+                real_data: Some(Bytes::from(data)),
             },
         );
 
@@ -521,7 +567,6 @@ impl Actor {
     }
 
     async fn handle_import_bao(&mut self, msg: ImportBaoMsg) {
-        use bao_tree::io::outboard::PreOrderMemOutboard;
         use proto::ImportBaoRequest;
 
         let ImportBaoMsg {
@@ -536,22 +581,21 @@ impl Actor {
         let blobs = self.blobs.clone();
 
         self.tasks.spawn(async move {
-            // consume all incoming chunks
+            // consume all incoming BAO chunks without storing them
             while let Ok(Some(_item)) = rx.recv().await {
                 // just drain them, don't store
             }
 
-            // once all chunks consumed, generate fake data to compute outboard
-            let data = generate_data_for_strategy(size_u64, strategy);
-            let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
-
-            // store metadata
+            // store minimal metadata (empty outboard - we won't re-export from this store)
+            // This avoids generating the full blob data just to compute the outboard,
+            // which would defeat the purpose of FakeStore for large blob imports.
             blobs.lock().unwrap().insert(
                 hash,
                 BlobMetadata {
                     size: size_u64,
-                    outboard: outboard.data.into(),
+                    outboard: Bytes::new(),
                     strategy,
+                    real_data: None,
                 },
             );
 
@@ -564,14 +608,40 @@ impl Actor {
 #[derive(Clone)]
 struct DataReader {
     strategy: DataStrategy,
+    /// Real data for dynamically-imported blobs. Takes priority over strategy.
+    real_data: Option<Bytes>,
 }
 
 impl DataReader {
     fn new(strategy: DataStrategy) -> Self {
-        Self { strategy }
+        Self {
+            strategy,
+            real_data: None,
+        }
+    }
+
+    fn with_real_data(real_data: Bytes) -> Self {
+        Self {
+            strategy: DataStrategy::Zeros, // unused when real_data is set
+            real_data: Some(real_data),
+        }
+    }
+
+    fn from_metadata(metadata: &BlobMetadata) -> Self {
+        match &metadata.real_data {
+            Some(data) => Self::with_real_data(data.clone()),
+            None => Self::new(metadata.strategy),
+        }
     }
 
     fn byte_at(&self, offset: u64) -> u8 {
+        if let Some(ref data) = self.real_data {
+            let idx = offset as usize;
+            if idx < data.len() {
+                return data[idx];
+            }
+            return 0; // shouldn't happen if sizes are correct
+        }
         match self.strategy {
             DataStrategy::Zeros => 0,
             DataStrategy::Ones => 0xFF,
@@ -591,6 +661,17 @@ impl DataReader {
 
 impl ReadAt for DataReader {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(ref data) = self.real_data {
+            let start = offset as usize;
+            let available = data.len().saturating_sub(start);
+            let to_copy = buf.len().min(available);
+            buf[..to_copy].copy_from_slice(&data[start..start + to_copy]);
+            // zero-fill remainder (shouldn't happen if sizes match)
+            for byte in buf[to_copy..].iter_mut() {
+                *byte = 0;
+            }
+            return Ok(buf.len());
+        }
         for (i, byte) in buf.iter_mut().enumerate() {
             *byte = self.byte_at(offset + i as u64);
         }
@@ -600,6 +681,14 @@ impl ReadAt for DataReader {
 
 impl ReadBytesAt for DataReader {
     fn read_bytes_at(&self, offset: u64, size: usize) -> io::Result<Bytes> {
+        if let Some(ref data) = self.real_data {
+            let start = offset as usize;
+            let end = (start + size).min(data.len());
+            if start < data.len() {
+                return Ok(data.slice(start..end));
+            }
+            return Ok(Bytes::from(vec![0u8; size]));
+        }
         let mut data = vec![0u8; size];
         self.read_at(offset, &mut data)?;
         Ok(Bytes::from(data))
@@ -619,11 +708,35 @@ fn compute_hash_for_strategy(size: u64, strategy: DataStrategy) -> Hash {
     Hash::from(outboard.root)
 }
 
+/// A sender wrapper that throttles bandwidth by sleeping between sends.
+struct ThrottledBaoTreeSender {
+    inner: mpsc::Sender<EncodedItem>,
+    bytes_per_sec: u64,
+}
+
+impl bao_tree::io::mixed::Sender for ThrottledBaoTreeSender {
+    type Error = irpc::channel::SendError;
+    async fn send(&mut self, item: EncodedItem) -> std::result::Result<(), Self::Error> {
+        // Calculate bytes in this item for throttling
+        let bytes = match &item {
+            EncodedItem::Leaf(Leaf { data, .. }) => data.len() as u64,
+            _ => 0,
+        };
+        // Sleep proportionally to simulate limited bandwidth
+        if bytes > 0 && self.bytes_per_sec > 0 {
+            let sleep_secs = bytes as f64 / self.bytes_per_sec as f64;
+            tokio::time::sleep(std::time::Duration::from_secs_f64(sleep_secs)).await;
+        }
+        self.inner.send(item).await
+    }
+}
+
 async fn export_bao(
     hash: Hash,
     metadata: Option<BlobMetadata>,
     ranges: ChunkRanges,
     mut sender: mpsc::Sender<EncodedItem>,
+    throttle_bytes_per_sec: Option<u64>,
 ) {
     let metadata = match metadata {
         Some(metadata) => metadata,
@@ -642,7 +755,7 @@ async fn export_bao(
     };
 
     let size = metadata.size;
-    let data = DataReader::new(metadata.strategy);
+    let data = DataReader::from_metadata(&metadata);
 
     let tree = BaoTree::new(size, IROH_BLOCK_SIZE);
     let outboard = PreOrderMemOutboard {
@@ -651,10 +764,20 @@ async fn export_bao(
         data: metadata.outboard,
     };
 
-    let sender = BaoTreeSender::ref_cast_mut(&mut sender);
-    traverse_ranges_validated(data, outboard, &ranges, sender)
-        .await
-        .ok();
+    if let Some(bps) = throttle_bytes_per_sec {
+        let mut throttled = ThrottledBaoTreeSender {
+            inner: sender,
+            bytes_per_sec: bps,
+        };
+        traverse_ranges_validated(data, outboard, &ranges, &mut throttled)
+            .await
+            .ok();
+    } else {
+        let sender = BaoTreeSender::ref_cast_mut(&mut sender);
+        traverse_ranges_validated(data, outboard, &ranges, sender)
+            .await
+            .ok();
+    }
 }
 
 async fn export_ranges(mut cmd: ExportRangesMsg, metadata: Option<BlobMetadata>) {
@@ -696,7 +819,7 @@ async fn export_ranges_impl(
                 "missing range: {requested:?}, present: {bitfield:?}",
             )));
         }
-        let reader = DataReader::new(metadata.strategy);
+        let reader = DataReader::from_metadata(&metadata);
         let bs = 1024;
         let mut offset = range.start;
         loop {
@@ -716,31 +839,43 @@ async fn export_ranges_impl(
 impl FakeStore {
     /// uses zeros strategy. for more control use [`FakeStore::builder()`]
     pub fn new(sizes: impl IntoIterator<Item = u64>) -> Self {
-        Self::builder().with_blobs(sizes).build()
+        let config = FakeStoreConfig::default();
+        let blob_specs: Vec<(u64, DataStrategy)> =
+            sizes.into_iter().map(|s| (s, config.strategy)).collect();
+        Self::new_with_config(blob_specs, config)
     }
 
     pub fn builder() -> FakeStoreBuilder {
         FakeStoreBuilder::new()
     }
 
-    fn new_with_config(sizes: impl IntoIterator<Item = u64>, config: FakeStoreConfig) -> Self {
+    fn new_with_config(
+        blob_specs: impl IntoIterator<Item = (u64, DataStrategy)>,
+        config: FakeStoreConfig,
+    ) -> Self {
         let mut blobs = HashMap::new();
-        for size in sizes {
-            let hash = compute_hash_for_strategy(size, config.strategy);
-            let data = generate_data_for_strategy(size, config.strategy);
+        for (size, strategy) in blob_specs {
+            let hash = compute_hash_for_strategy(size, strategy);
+            let data = generate_data_for_strategy(size, strategy);
             let outboard_data = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
             blobs.insert(
                 hash,
                 BlobMetadata {
                     size,
                     outboard: outboard_data.data.into(),
-                    strategy: config.strategy,
+                    strategy,
+                    real_data: None,
                 },
             );
         }
 
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        let actor = Actor::new(receiver, blobs, config.strategy);
+        let actor = Actor::new(
+            receiver,
+            blobs,
+            config.strategy,
+            config.throttle_bytes_per_sec,
+        );
         tokio::spawn(actor.run());
 
         // Store is #[repr(transparent)] so we can use RefCast
@@ -783,11 +918,11 @@ async fn export_path_impl(
     let mut file = std::fs::File::create(&target)?;
     tx.send(ExportProgressItem::Size(size)).await?;
 
-    let buf = [0u8; 1024 * 64];
+    let reader = DataReader::from_metadata(&metadata);
     for offset in (0..size).step_by(1024 * 64) {
         let len = std::cmp::min(size - offset, 1024 * 64) as usize;
-        let buf = &buf[..len];
-        file.write_all(buf)?;
+        let buf = reader.read_bytes_at(offset, len)?;
+        file.write_all(&buf)?;
         tx.try_send(ExportProgressItem::CopyProgress(offset))
             .await?;
     }
