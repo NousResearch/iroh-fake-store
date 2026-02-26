@@ -483,11 +483,9 @@ async fn test_concurrent_operations() -> TestResult<()> {
 /// end-to-end test with actual iroh protocol using pseudo-random data
 /// tests: provider serves prng data, downloader fetches & validates,
 /// hash validation works (proves our data gen is consistent)
-/// NOTE: ignored because iroh 0.96 address discovery changes break local e2e tests
 #[tokio::test]
-#[ignore]
 async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
-    use iroh::{Endpoint, protocol::Router};
+    use iroh::{Endpoint, address_lookup::memory::MemoryLookup, protocol::Router};
     use iroh_blobs::BlobsProtocol;
 
     tracing_subscriber::fmt::try_init().ok();
@@ -512,7 +510,11 @@ async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
     use iroh_blobs::store::mem::MemStore;
     let receiver_store = MemStore::new();
 
-    let receiver_endpoint = Endpoint::builder().bind().await?;
+    let address_lookup = MemoryLookup::from_endpoint_info([provider_addr.clone()]);
+    let receiver_endpoint = Endpoint::builder()
+        .address_lookup(address_lookup)
+        .bind()
+        .await?;
 
     let downloader = receiver_store.downloader(&receiver_endpoint);
     println!("starting download...");
@@ -568,17 +570,15 @@ async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
     provider_router.shutdown().await?;
     receiver_endpoint.close().await;
 
-    println!("e2e transfer with prng data works");
+    println!("e2e transfer with prng data works (◕‿◕)");
 
     Ok(())
 }
 
 /// e2e test with both stores being FakeStore using downloader
-/// NOTE: ignored because iroh 0.96 address discovery changes break local e2e tests
 #[tokio::test]
-#[ignore]
 async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
-    use iroh::{Endpoint, protocol::Router};
+    use iroh::{Endpoint, address_lookup::memory::MemoryLookup, protocol::Router};
     use iroh_blobs::BlobsProtocol;
 
     tracing_subscriber::fmt::try_init().ok();
@@ -606,7 +606,11 @@ async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
         .strategy(DataStrategy::PseudoRandom { seed: 42 })
         .build();
 
-    let receiver_endpoint = Endpoint::builder().bind().await?;
+    let address_lookup = MemoryLookup::from_endpoint_info([provider_addr.clone()]);
+    let receiver_endpoint = Endpoint::builder()
+        .address_lookup(address_lookup)
+        .bind()
+        .await?;
 
     // download
     let downloader = receiver_store.downloader(&receiver_endpoint);
@@ -639,7 +643,7 @@ async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
     provider_router.shutdown().await?;
     receiver_endpoint.close().await;
 
-    println!("both stores are fake, downloader works, no memory allocated");
+    println!("both stores are fake, downloader works, no memory allocated ᕕ( ᐛ )ᕗ");
 
     Ok(())
 }
@@ -679,7 +683,6 @@ async fn test_dynamic_blob_addition() -> TestResult<()> {
     }
 
     // verify we can read it back
-    // dynamically-added blobs serve their real data (not the store's default strategy)
     use range_collections::RangeSet2;
     let mut ranges = store
         .blobs()
