@@ -6,15 +6,19 @@
 
 fake `iroh-blobs` store for testing. generates data on-the-fly without storing anything in RAM or disk.
 
+compatible with `iroh-blobs` 0.98 and `iroh` 0.96.
+
 ## what it does
 
 for testing with large blobs (like 2TB) when you don't care about actual content. features:
 
 - zero allocation: generates data on-the-fly
 - deterministic: same config = same hashes
-- configurable: zeros, ones, or pseudo-random data
+- configurable: zeros, ones, or pseudo-random data (per-store or per-blob)
 - safe limits: 10GB default max to prevent accidents
 - full protocol support: implements complete `iroh-blobs` store protocol
+- bandwidth throttling: simulate slow peers
+- real data round-trip: blobs added via `add_bytes`/`add_byte_stream` serve back their original data
 
 ## installation
 
@@ -59,11 +63,34 @@ let store = FakeStore::builder()
     .build();
 ```
 
+### unique blobs with distinct hashes
+
+when you need many same-sized blobs that are distinguishable by hash:
+
+```rust
+let store = FakeStore::builder()
+    .with_unique_blobs(100, 1024 * 1024) // 100 x 1MB blobs, each with a unique seed
+    .build();
+```
+
+### bandwidth throttling
+
+simulate slow peers by throttling read bandwidth:
+
+```rust
+let store = FakeStore::builder()
+    .with_throttle(1024 * 1024) // 1MB/s
+    .with_blob(10 * 1024 * 1024)
+    .build();
+```
+
 ### data strategies
 
 - `DataStrategy::Zeros`: all zeros (default, most efficient)
 - `DataStrategy::Ones`: all ones (0xFF)
 - `DataStrategy::PseudoRandom { seed }`: deterministic pseudo-random
+
+the strategy can be set globally via the builder, or per-blob using `with_unique_blobs` which assigns each blob a different `PseudoRandom` seed.
 
 ```rust
 // zeros (default)
@@ -74,6 +101,16 @@ let store = FakeStore::builder()
     .strategy(DataStrategy::PseudoRandom { seed: 12345 })
     .with_blob(1024 * 1024)
     .build();
+```
+
+### dynamic blob addition
+
+blobs added at runtime via `add_bytes` or `add_byte_stream` store and serve back their real data:
+
+```rust
+let store = FakeStore::new([]);
+let tag = store.blobs().add_bytes(b"hello world".to_vec()).tag().await?;
+// reading this blob back returns the original "hello world" bytes
 ```
 
 ## testing large blobs
@@ -118,8 +155,9 @@ let store = FakeStore::builder()
 
 1. **hash computation**: hashes computed once at store creation via BAO tree
 2. **outboard storage**: BAO tree outboard stored in memory (small, ~O(log(size)))
-3. **data generation**: blob data generated on-demand during reads
-4. **zero allocation**: no blob data stored, generated as needed
+3. **data generation**: blob data generated on-demand during reads using the configured strategy
+4. **zero allocation**: no blob data stored for pre-configured blobs, generated as needed
+5. **real data storage**: blobs added dynamically via `add_bytes`/`add_byte_stream` keep their original data in memory so it can be served back correctly
 
 ### memory usage
 
