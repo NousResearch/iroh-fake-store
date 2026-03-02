@@ -632,7 +632,15 @@ impl DataReader {
                 x = x ^ (x >> 31);
                 (x >> 24) as u8
             }
-            DataStrategy::RealData(data) => data[offset as usize],
+            DataStrategy::RealData(data) => {
+                let idx = offset as usize;
+                assert!(
+                    idx < data.len(),
+                    "RealData offset {idx} out of bounds (len {})",
+                    data.len()
+                );
+                data[idx]
+            }
         }
     }
 }
@@ -642,7 +650,13 @@ impl ReadAt for DataReader {
         // For RealData, use bulk copy for efficiency
         if let DataStrategy::RealData(ref data) = self.strategy {
             let start = offset as usize;
-            buf.copy_from_slice(&data[start..start + buf.len()]);
+            let end = start + buf.len();
+            assert!(
+                end <= data.len(),
+                "RealData read_at out of bounds: {start}..{end} but len is {}",
+                data.len()
+            );
+            buf.copy_from_slice(&data[start..end]);
             return Ok(buf.len());
         }
         for (i, byte) in buf.iter_mut().enumerate() {
@@ -656,7 +670,12 @@ impl ReadBytesAt for DataReader {
     fn read_bytes_at(&self, offset: u64, size: usize) -> io::Result<Bytes> {
         if let DataStrategy::RealData(ref data) = self.strategy {
             let start = offset as usize;
-            let end = (start + size).min(data.len());
+            let end = start + size;
+            assert!(
+                end <= data.len(),
+                "RealData read_bytes_at out of bounds: {start}..{end} but len is {}",
+                data.len()
+            );
             return Ok(data.slice(start..end));
         }
         let mut data = vec![0u8; size];
