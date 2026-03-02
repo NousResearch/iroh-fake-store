@@ -60,7 +60,7 @@ use ref_cast::RefCast;
 use tokio::task::{JoinError, JoinSet};
 
 /// data generation strategy for fake blobs
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataStrategy {
     /// all zeros (default, most efficient)
     Zeros,
@@ -68,6 +68,8 @@ pub enum DataStrategy {
     Ones,
     /// deterministic pseudo-random based on seed
     PseudoRandom { seed: u64 },
+    /// real data
+    RealData(Bytes),
 }
 
 impl Default for DataStrategy {
@@ -158,7 +160,12 @@ impl FakeStoreBuilder {
         let blob_specs: Vec<(u64, DataStrategy)> = self
             .blobs
             .into_iter()
-            .map(|(size, strategy)| (size, strategy.unwrap_or(self.config.strategy)))
+            .map(|(size, strategy)| {
+                (
+                    size,
+                    strategy.unwrap_or_else(|| self.config.strategy.clone()),
+                )
+            })
             .collect();
 
         FakeStore::new_with_config(blob_specs, self.config)
@@ -215,9 +222,6 @@ struct BlobMetadata {
     size: u64,
     outboard: Bytes,
     strategy: DataStrategy,
-    /// Real data for dynamically-imported blobs (via add_bytes/add_byte_stream).
-    /// When set, this takes priority over the strategy for data generation.
-    real_data: Option<Bytes>,
 }
 
 struct Actor {
@@ -483,8 +487,7 @@ impl Actor {
             BlobMetadata {
                 size,
                 outboard: outboard.data.into(),
-                strategy: self.strategy,
-                real_data: Some(Bytes::copy_from_slice(&data)),
+                strategy: DataStrategy::RealData(Bytes::copy_from_slice(&data)),
             },
         );
 
@@ -550,8 +553,7 @@ impl Actor {
             BlobMetadata {
                 size,
                 outboard: outboard.data.into(),
-                strategy: self.strategy,
-                real_data: Some(Bytes::from(data)),
+                strategy: DataStrategy::RealData(Bytes::from(data)),
             },
         );
 
@@ -577,7 +579,7 @@ impl Actor {
         } = msg;
 
         let size_u64 = size.get();
-        let strategy = self.strategy;
+        let strategy = self.strategy.clone();
         let blobs = self.blobs.clone();
 
         self.tasks.spawn(async move {
@@ -595,7 +597,6 @@ impl Actor {
                     size: size_u64,
                     outboard: Bytes::new(),
                     strategy,
-                    real_data: None,
                 },
             );
 
@@ -608,68 +609,40 @@ impl Actor {
 #[derive(Clone)]
 struct DataReader {
     strategy: DataStrategy,
-    /// Real data for dynamically-imported blobs. Takes priority over strategy.
-    real_data: Option<Bytes>,
 }
 
 impl DataReader {
     fn new(strategy: DataStrategy) -> Self {
-        Self {
-            strategy,
-            real_data: None,
-        }
-    }
-
-    fn with_real_data(real_data: Bytes) -> Self {
-        Self {
-            strategy: DataStrategy::Zeros, // unused when real_data is set
-            real_data: Some(real_data),
-        }
+        Self { strategy }
     }
 
     fn from_metadata(metadata: &BlobMetadata) -> Self {
-        match &metadata.real_data {
-            Some(data) => Self::with_real_data(data.clone()),
-            None => Self::new(metadata.strategy),
-        }
+        Self::new(metadata.strategy.clone())
     }
 
     fn byte_at(&self, offset: u64) -> u8 {
-        if let Some(ref data) = self.real_data {
-            let idx = offset as usize;
-            if idx < data.len() {
-                return data[idx];
-            }
-            return 0; // shouldn't happen if sizes are correct
-        }
-        match self.strategy {
+        match &self.strategy {
             DataStrategy::Zeros => 0,
             DataStrategy::Ones => 0xFF,
             DataStrategy::PseudoRandom { seed } => {
-                // offset-based hashing for independent byte generation
-                // simpler than LCG jump-ahead, still deterministic
-                // simple mixing function (SplitMix64-inspired)
+                let seed = *seed;
                 let mut x = seed.wrapping_add(offset);
                 x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
                 x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
                 x = x ^ (x >> 31);
                 (x >> 24) as u8
             }
+            DataStrategy::RealData(data) => data[offset as usize],
         }
     }
 }
 
 impl ReadAt for DataReader {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some(ref data) = self.real_data {
+        // For RealData, use bulk copy for efficiency
+        if let DataStrategy::RealData(ref data) = self.strategy {
             let start = offset as usize;
-            let available = data.len().saturating_sub(start);
-            let to_copy = buf.len().min(available);
-            buf[..to_copy].copy_from_slice(&data[start..start + to_copy]);
-            // zero-fill remainder (shouldn't happen if sizes match)
-            for byte in buf[to_copy..].iter_mut() {
-                *byte = 0;
-            }
+            buf.copy_from_slice(&data[start..start + buf.len()]);
             return Ok(buf.len());
         }
         for (i, byte) in buf.iter_mut().enumerate() {
@@ -681,13 +654,10 @@ impl ReadAt for DataReader {
 
 impl ReadBytesAt for DataReader {
     fn read_bytes_at(&self, offset: u64, size: usize) -> io::Result<Bytes> {
-        if let Some(ref data) = self.real_data {
+        if let DataStrategy::RealData(ref data) = self.strategy {
             let start = offset as usize;
             let end = (start + size).min(data.len());
-            if start < data.len() {
-                return Ok(data.slice(start..end));
-            }
-            return Ok(Bytes::from(vec![0u8; size]));
+            return Ok(data.slice(start..end));
         }
         let mut data = vec![0u8; size];
         self.read_at(offset, &mut data)?;
@@ -695,14 +665,14 @@ impl ReadBytesAt for DataReader {
     }
 }
 
-fn generate_data_for_strategy(size: u64, strategy: DataStrategy) -> Vec<u8> {
-    let reader = DataReader::new(strategy);
+fn generate_data_for_strategy(size: u64, strategy: &DataStrategy) -> Vec<u8> {
+    let reader = DataReader::new(strategy.clone());
     let mut data = vec![0u8; size as usize];
     reader.read_at(0, &mut data).expect("read should succeed");
     data
 }
 
-fn compute_hash_for_strategy(size: u64, strategy: DataStrategy) -> Hash {
+fn compute_hash_for_strategy(size: u64, strategy: &DataStrategy) -> Hash {
     let data = generate_data_for_strategy(size, strategy);
     let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
     Hash::from(outboard.root)
@@ -840,8 +810,10 @@ impl FakeStore {
     /// uses zeros strategy. for more control use [`FakeStore::builder()`]
     pub fn new(sizes: impl IntoIterator<Item = u64>) -> Self {
         let config = FakeStoreConfig::default();
-        let blob_specs: Vec<(u64, DataStrategy)> =
-            sizes.into_iter().map(|s| (s, config.strategy)).collect();
+        let blob_specs: Vec<(u64, DataStrategy)> = sizes
+            .into_iter()
+            .map(|s| (s, config.strategy.clone()))
+            .collect();
         Self::new_with_config(blob_specs, config)
     }
 
@@ -855,8 +827,8 @@ impl FakeStore {
     ) -> Self {
         let mut blobs = HashMap::new();
         for (size, strategy) in blob_specs {
-            let hash = compute_hash_for_strategy(size, strategy);
-            let data = generate_data_for_strategy(size, strategy);
+            let hash = compute_hash_for_strategy(size, &strategy);
+            let data = generate_data_for_strategy(size, &strategy);
             let outboard_data = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
             blobs.insert(
                 hash,
@@ -864,7 +836,6 @@ impl FakeStore {
                     size,
                     outboard: outboard_data.data.into(),
                     strategy,
-                    real_data: None,
                 },
             );
         }
