@@ -25,6 +25,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::{self, Write},
+    num::NonZeroU64,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -84,7 +85,7 @@ pub struct FakeStoreConfig {
     /// max blob size (prevents accidents)
     pub max_blob_size: Option<u64>,
     /// throttle read bandwidth to this many bytes per second (None = unlimited)
-    pub throttle_bytes_per_sec: Option<u64>,
+    pub throttle_bytes_per_sec: Option<NonZeroU64>,
 }
 
 impl Default for FakeStoreConfig {
@@ -143,7 +144,7 @@ impl FakeStoreBuilder {
 
     /// Throttle read bandwidth to the given bytes per second.
     /// This simulates slow peers by adding delays during BAO export.
-    pub fn with_throttle(mut self, bytes_per_sec: u64) -> Self {
+    pub fn with_throttle(mut self, bytes_per_sec: NonZeroU64) -> Self {
         self.config.throttle_bytes_per_sec = Some(bytes_per_sec);
         self
     }
@@ -231,7 +232,7 @@ struct Actor {
     blobs: Arc<Mutex<HashMap<Hash, BlobMetadata>>>,
     strategy: DataStrategy,
     tags: BTreeMap<api::Tag, HashAndFormat>,
-    throttle_bytes_per_sec: Option<u64>,
+    throttle_bytes_per_sec: Option<NonZeroU64>,
 }
 
 impl Actor {
@@ -239,7 +240,7 @@ impl Actor {
         commands: tokio::sync::mpsc::Receiver<proto::Command>,
         blobs: HashMap<Hash, BlobMetadata>,
         strategy: DataStrategy,
-        throttle_bytes_per_sec: Option<u64>,
+        throttle_bytes_per_sec: Option<NonZeroU64>,
     ) -> Self {
         Self {
             blobs: Arc::new(Mutex::new(blobs)),
@@ -700,7 +701,7 @@ fn compute_hash_for_strategy(size: u64, strategy: &DataStrategy) -> Hash {
 /// A sender wrapper that throttles bandwidth by sleeping between sends.
 struct ThrottledBaoTreeSender {
     inner: mpsc::Sender<EncodedItem>,
-    bytes_per_sec: u64,
+    bytes_per_sec: NonZeroU64,
 }
 
 impl bao_tree::io::mixed::Sender for ThrottledBaoTreeSender {
@@ -712,8 +713,8 @@ impl bao_tree::io::mixed::Sender for ThrottledBaoTreeSender {
             _ => 0,
         };
         // Sleep proportionally to simulate limited bandwidth
-        if bytes > 0 && self.bytes_per_sec > 0 {
-            let sleep_secs = bytes as f64 / self.bytes_per_sec as f64;
+        if bytes > 0 {
+            let sleep_secs = bytes as f64 / self.bytes_per_sec.get() as f64;
             tokio::time::sleep(std::time::Duration::from_secs_f64(sleep_secs)).await;
         }
         self.inner.send(item).await
@@ -725,7 +726,7 @@ async fn export_bao(
     metadata: Option<BlobMetadata>,
     ranges: ChunkRanges,
     mut sender: mpsc::Sender<EncodedItem>,
-    throttle_bytes_per_sec: Option<u64>,
+    throttle_bytes_per_sec: Option<NonZeroU64>,
 ) {
     let metadata = match metadata {
         Some(metadata) => metadata,
