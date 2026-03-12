@@ -40,7 +40,7 @@ async fn test_observe() -> TestResult<()> {
     let store = FakeStore::new(INTERESTING_SIZES);
 
     for &size in &INTERESTING_SIZES {
-        let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
         let bitfield = store.blobs().observe(hash).await?;
         assert_eq!(bitfield.size(), size);
         assert!(bitfield.is_complete());
@@ -52,7 +52,7 @@ async fn test_observe() -> TestResult<()> {
 async fn test_export_bao_all_ranges() -> TestResult<()> {
     for &size in &INTERESTING_SIZES {
         let store = FakeStore::new([size]);
-        let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
 
         let stream = store.blobs().export_bao(hash, ChunkRanges::all()).stream();
         let mut items = vec![];
@@ -82,7 +82,7 @@ async fn test_export_bao_all_ranges() -> TestResult<()> {
 async fn test_export_bao_specific_ranges() -> TestResult<()> {
     let size = 1024 * 256;
     let store = FakeStore::new([size]);
-    let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
 
     let ranges = ChunkRanges::chunks(0..8);
     let stream = store.blobs().export_bao(hash, ranges).stream();
@@ -111,7 +111,7 @@ async fn test_export_ranges() -> TestResult<()> {
         }
 
         let store = FakeStore::new([size]);
-        let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
 
         let ranges = 0..size.min(1024);
         let stream = store.blobs().export_ranges(hash, ranges.clone()).stream();
@@ -150,7 +150,7 @@ async fn test_export_path() -> TestResult<()> {
 
     for &size in &INTERESTING_SIZES {
         let store = FakeStore::new([size]);
-        let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
 
         let out_path = tempdir.path().join(format!("out-{size}"));
         store.blobs().export(hash, &out_path).await?;
@@ -169,8 +169,8 @@ async fn test_export_path() -> TestResult<()> {
 #[tokio::test]
 async fn test_hash_computation() -> TestResult<()> {
     for &size in &INTERESTING_SIZES {
-        let hash1 = compute_hash_for_strategy(size, DataStrategy::Zeros);
-        let hash2 = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let hash1 = compute_hash_for_strategy(size, &DataStrategy::Zeros);
+        let hash2 = compute_hash_for_strategy(size, &DataStrategy::Zeros);
         assert_eq!(
             hash1, hash2,
             "Hash should be deterministic for size {}",
@@ -338,7 +338,7 @@ async fn test_multiple_blobs() -> TestResult<()> {
     assert_eq!(hashes.len(), sizes.len());
 
     for &size in &sizes {
-        let expected_hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let expected_hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
         assert!(
             hashes.contains(&expected_hash),
             "Hash for size {} should be in list",
@@ -370,7 +370,7 @@ async fn test_nonexistent_blob() -> TestResult<()> {
 async fn test_large_blob() -> TestResult<()> {
     let size = 1024 * 1024 * 100; // 100MB
     let store = FakeStore::new([size]);
-    let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
 
     let status = store.blobs().status(hash).await?;
     match status {
@@ -403,7 +403,7 @@ async fn test_large_blob() -> TestResult<()> {
 #[tokio::test]
 async fn test_empty_blob() -> TestResult<()> {
     let store = FakeStore::new([0]);
-    let hash = compute_hash_for_strategy(0, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(0, &DataStrategy::Zeros);
 
     let status = store.blobs().status(hash).await?;
     match status {
@@ -428,7 +428,7 @@ async fn test_export_bao_to_vec() -> TestResult<()> {
         }
 
         let store = FakeStore::new([size]);
-        let hash = compute_hash_for_strategy(size, DataStrategy::Zeros);
+        let hash = compute_hash_for_strategy(size, &DataStrategy::Zeros);
 
         let exported = store
             .blobs()
@@ -485,7 +485,7 @@ async fn test_concurrent_operations() -> TestResult<()> {
 /// hash validation works (proves our data gen is consistent)
 #[tokio::test]
 async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
-    use iroh::{Endpoint, Watcher, protocol::Router};
+    use iroh::{Endpoint, address_lookup::memory::MemoryLookup, protocol::Router};
     use iroh_blobs::BlobsProtocol;
 
     tracing_subscriber::fmt::try_init().ok();
@@ -499,25 +499,28 @@ async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
     println!("provider created blob with hash: {}", hash);
 
     let provider_endpoint = Endpoint::builder().bind().await?;
-    let provider_blobs = BlobsProtocol::new(&provider_store, provider_endpoint.clone(), None);
+    let provider_blobs = BlobsProtocol::new(&provider_store, None);
     let provider_router = Router::builder(provider_endpoint.clone())
         .accept(iroh_blobs::ALPN, provider_blobs)
         .spawn();
 
-    let provider_addr = provider_router.endpoint().node_addr().initialized().await;
+    let provider_addr = provider_router.endpoint().addr();
     println!("provider listening at: {:?}", provider_addr);
 
     use iroh_blobs::store::mem::MemStore;
     let receiver_store = MemStore::new();
 
-    let receiver_endpoint = Endpoint::builder().bind().await?;
-    receiver_endpoint.add_node_addr(provider_addr.clone())?;
+    let address_lookup = MemoryLookup::from_endpoint_info([provider_addr.clone()]);
+    let receiver_endpoint = Endpoint::builder()
+        .address_lookup(address_lookup)
+        .bind()
+        .await?;
 
     let downloader = receiver_store.downloader(&receiver_endpoint);
     println!("starting download...");
 
     let mut progress = downloader
-        .download(hash, Some(provider_addr.node_id))
+        .download(hash, vec![provider_addr.id])
         .stream()
         .await?;
 
@@ -575,7 +578,7 @@ async fn test_e2e_transfer_with_pseudo_random() -> TestResult<()> {
 /// e2e test with both stores being FakeStore using downloader
 #[tokio::test]
 async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
-    use iroh::{Endpoint, Watcher, protocol::Router};
+    use iroh::{Endpoint, address_lookup::memory::MemoryLookup, protocol::Router};
     use iroh_blobs::BlobsProtocol;
 
     tracing_subscriber::fmt::try_init().ok();
@@ -591,25 +594,28 @@ async fn test_e2e_both_fake_stores_downloader() -> TestResult<()> {
 
     // setup provider
     let provider_endpoint = Endpoint::builder().bind().await?;
-    let provider_blobs = BlobsProtocol::new(&provider_store, provider_endpoint.clone(), None);
+    let provider_blobs = BlobsProtocol::new(&provider_store, None);
     let provider_router = Router::builder(provider_endpoint.clone())
         .accept(iroh_blobs::ALPN, provider_blobs)
         .spawn();
 
-    let provider_addr = provider_router.endpoint().node_addr().initialized().await;
+    let provider_addr = provider_router.endpoint().addr();
 
     // receiver is also FakeStore with same strategy, starts empty
     let receiver_store = FakeStore::builder()
         .strategy(DataStrategy::PseudoRandom { seed: 42 })
         .build();
 
-    let receiver_endpoint = Endpoint::builder().bind().await?;
-    receiver_endpoint.add_node_addr(provider_addr.clone())?;
+    let address_lookup = MemoryLookup::from_endpoint_info([provider_addr.clone()]);
+    let receiver_endpoint = Endpoint::builder()
+        .address_lookup(address_lookup)
+        .bind()
+        .await?;
 
     // download
     let downloader = receiver_store.downloader(&receiver_endpoint);
     let mut progress = downloader
-        .download(hash, Some(provider_addr.node_id))
+        .download(hash, vec![provider_addr.id])
         .stream()
         .await?;
 
@@ -677,7 +683,6 @@ async fn test_dynamic_blob_addition() -> TestResult<()> {
     }
 
     // verify we can read it back
-    // it will be served as pseudo-random data based on the strategy, not the original 0xAB
     use range_collections::RangeSet2;
     let mut ranges = store
         .blobs()
@@ -691,14 +696,14 @@ async fn test_dynamic_blob_addition() -> TestResult<()> {
         }
     }
 
-    // data should be pseudo-random, not all 0xAB
+    // data should be the original 0xAB bytes we imported
     assert_eq!(data.len(), 1024 * 1024);
     assert!(
-        data.iter().any(|&b| b != 0xAB),
-        "data should be pseudo-random, not original data"
+        data.iter().all(|&b| b == 0xAB),
+        "dynamically-added blob should serve back the original data"
     );
 
-    println!("blob was added and can be read back as fake data ᕕ( ᐛ )ᕗ");
+    println!("blob was added and can be read back with real data ᕕ( ᐛ )ᕗ");
 
     Ok(())
 }
@@ -706,7 +711,7 @@ async fn test_dynamic_blob_addition() -> TestResult<()> {
 #[tokio::test]
 async fn test_tag_create_and_list() -> TestResult<()> {
     let store = FakeStore::new([1024]);
-    let hash = compute_hash_for_strategy(1024, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(1024, &DataStrategy::Zeros);
 
     // create a tag
     let tag = store
@@ -777,7 +782,7 @@ async fn test_tag_set() -> TestResult<()> {
 #[tokio::test]
 async fn test_tag_rename() -> TestResult<()> {
     let store = FakeStore::new([1024]);
-    let hash = compute_hash_for_strategy(1024, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(1024, &DataStrategy::Zeros);
 
     // create a tag
     let tag = store
@@ -812,7 +817,7 @@ async fn test_tag_rename() -> TestResult<()> {
 #[tokio::test]
 async fn test_tag_delete() -> TestResult<()> {
     let store = FakeStore::new([1024]);
-    let hash = compute_hash_for_strategy(1024, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(1024, &DataStrategy::Zeros);
 
     // create two tags
     let tag1 = store
@@ -868,7 +873,7 @@ async fn test_tag_delete() -> TestResult<()> {
 #[tokio::test]
 async fn test_tag_multiple_tags_same_hash() -> TestResult<()> {
     let store = FakeStore::new([1024]);
-    let hash = compute_hash_for_strategy(1024, DataStrategy::Zeros);
+    let hash = compute_hash_for_strategy(1024, &DataStrategy::Zeros);
 
     // create multiple tags for same hash
     let tag1 = store
